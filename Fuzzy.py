@@ -8,6 +8,8 @@
 # Kaja Bilińska, kaja.bilinska@pwr.edu.pl           # 
 # Jan Schneider, jan.schneider@pwr.edu.pl           #
 #                                                   #
+#   	arXiv:2602.20183                            #
+#                                                   #
 #####################################################
 
 import numpy as np
