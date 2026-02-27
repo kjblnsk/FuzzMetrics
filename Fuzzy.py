@@ -231,7 +231,7 @@ class FuzzyNumber:
 
         def skewness_v1():
             """
-            here description which skewness it is + cite
+            Li et al.
             """
 
             def x_Ksi_d_x_Ksi_u(x):
@@ -257,7 +257,7 @@ class FuzzyNumber:
 
         def skewness_v2():
             """
-            here description which skewness it is + cite
+            Bermudez & Vercher
             """
 
             def sum_Ksi_u_d(x):
@@ -284,7 +284,7 @@ class FuzzyNumber:
     
         def skewness_v3(alpha = .1): # 0.25
             """
-            ...
+            Our definition
             """
 
             try:
@@ -320,7 +320,7 @@ class FuzzyNumber:
   
         def skewness_v4():
             """
-            ...
+            Our definition
             """
             
             l = self.Ksi_d(0)
@@ -621,8 +621,6 @@ for m in range(300,1000,100):
     ksi_u, ksi_d = fn.manual_fuzzy(X=x, Y=y)
     fn.calculate_skewness([ksi_u,ksi_d], version=3)
     print(np.round(fn.skewness_v3,2))
-
-exit()
 
 N = 101
 
