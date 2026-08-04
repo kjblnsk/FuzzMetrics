@@ -13,7 +13,6 @@
 #                                                   #
 #####################################################
 
-
 import os
 import datetime
 import numpy as np
@@ -62,20 +61,34 @@ for tkr in tickers:
     monthly_last = prices.resample('ME').last()
     monthly_ret = monthly_last.pct_change()
     
-    first_daily_price = prices.iloc[0]
-    first_month_last_price = monthly_last.iloc[0]
-    monthly_ret.iloc[0] = (first_month_last_price - first_daily_price) / first_daily_price
+    # Keep full calendar months only: the first pct_change entry is NaN and a
+    # synthesized replacement would be a partial-month return (the daily
+    # series starts mid-month; META was listed 2012-05-18). Non-META returns
+    # therefore start Feb 2012 and META starts Jun 2012 (Section IV-A).
+    monthly_ret = monthly_ret.dropna()
         
     monthly_ret.name = tkr
     returns_list.append(monthly_ret)
 
-all_returns = pd.concat(returns_list, axis=1).dropna()
+# Unbalanced panel at the start (META enters Jun 2012), as described in the
+# paper; the early months of the other assets are NOT dropped. NaNs occur only
+# in META's column before Jun 2012 and are handled by np.nanquantile below.
+all_returns = pd.concat(returns_list, axis=1)
 
 n_months = len(all_returns)
 train_idx = int(np.floor((2/3) * n_months))
 train_data = all_returns.iloc[:train_idx, :]
 test_data  = all_returns.iloc[train_idx:n_months, :]
 test_mat = test_data.values
+
+print(f"Panel: {all_returns.index[0]:%Y-%m} to {all_returns.index[-1]:%Y-%m} ({n_months} months)")
+print(f"Train: {train_data.index[0]:%Y-%m} to {train_data.index[-1]:%Y-%m} ({len(train_data)} months)")
+print(f"Test : {test_data.index[0]:%Y-%m} to {test_data.index[-1]:%Y-%m} ({len(test_data)} months)")
+for tkr in tickers:
+    n_obs = int(train_data[tkr].notna().sum())
+    if n_obs < len(train_data):
+        print(f"  {tkr}: {n_obs} training observations (late listing)")
+assert not test_data.isna().any().any(), "NaNs in the test window -- check data download"
 
 def fuzzify_asset_quantile(return_vector, alpha_step=0.05):
     alphas = np.arange(0, 1 + alpha_step, alpha_step)
@@ -123,6 +136,13 @@ int_weights = np.full(len(alphas), delta_alpha)
 int_weights[0] = delta_alpha / 2
 int_weights[-1] = delta_alpha / 2
 
+# Trapezoid weights for integrals over [0, 0.5]: alpha = 0.5 is an endpoint of
+# the half-range and gets half weight (int_weights would give it a full
+# interior weight there).
+half_weights = np.full(int(np.sum(alphas <= 0.5)), delta_alpha)
+half_weights[0] = delta_alpha / 2
+half_weights[-1] = delta_alpha / 2
+
 Xi_d = np.column_stack([fuzzy_assets[t]['xi_d'] for t in tickers])
 Xi_u = np.column_stack([fuzzy_assets[t]['xi_u'] for t in tickers])
 
@@ -149,7 +169,7 @@ eq_Risk_sq = np.sum(eq_Pu * int_weights - eq_Pd * int_weights)**2
 eq_E_LGY = np.sum((eq_Pd + eq_Pu) * lgy_eff_w)
 eq_Var_LGY = np.sum(((eq_Pd - eq_E_LGY)**2 + (eq_Pu - eq_E_LGY)**2) * lgy_eff_w)
 
-print("Computing asset-level fuzzy metrics from KDE fuzzy numbers...")
+print("Computing asset-level fuzzy metrics from quantile-based fuzzy numbers...")
 
 def compute_asset_fuzzy_metrics():
     a_vals = alphas
@@ -205,7 +225,7 @@ def compute_asset_fuzzy_metrics():
         num_u = xi_u[half_idx] + xi_u[one_m_idx] - 2 * xi_u[i05]
         den_u = xi_u[half_idx] - xi_u[one_m_idx]
         
-        hw = int_weights[half_idx]
+        hw = half_weights
         S_in_int = 0.5 * (
             np.sum(num_d * hw) / (np.sum(den_d * hw) + 1e-9) + 
             np.sum(num_u * hw) / (np.sum(den_u * hw) + 1e-9)
@@ -274,9 +294,15 @@ print(f"Asset-level fuzzy metrics written to:\n  {asset_metrics_csv}\n  {asset_m
 def run_grid(rho, beta):
     res_list = []
     
-    feas_JKPT = np.where((E_P_universe >= eq_E_P * rho) & (Risk_omega_sq_universe <= eq_Risk_sq * beta))[0]
-    feas_VB13 = np.where((E_P_universe >= eq_E_P * rho) & (Risk_omega_universe <= np.sqrt(eq_Risk_sq) * beta))[0]
+    # VB13 and all JKPT configurations share the same constraint operators
+    # (possibilistic mean and SQUARED downside risk), as stated in Section IV-B
+    # of the paper. BUGFIX: the old code applied beta to omega for VB13 instead
+    # of omega^2, which coincides with the JKPT constraint only at beta = 1.
+    feas_poss = np.where((E_P_universe >= eq_E_P * rho) & (Risk_omega_sq_universe <= eq_Risk_sq * beta))[0]
+    feas_JKPT = feas_poss
+    feas_VB13 = feas_poss
     feas_LGY  = np.where((E_LGY_universe >= eq_E_LGY * rho) & (Var_LGY_universe <= eq_Var_LGY * beta))[0]
+    print(f"   Feasible: VB13/JKPT = {len(feas_poss):,}, LGY15 = {len(feas_LGY):,}")
     
     def get_oos(w, method, feas_cnt):
         if len(feas_cnt) == 0 or w is None:
@@ -360,15 +386,19 @@ def run_grid(rho, beta):
         p_vals = alphas[half_idx]
         one_m_idx = [np.argmin(np.abs(alphas - (1 - pv))) for pv in p_vals]
         
-        i05_mat = np.tile(Pd_f[:, np.argmin(np.abs(alphas - 0.50))], (len(half_idx), 1)).T
+        # BUGFIX: the right component's GM2 numerator must subtract 2*xi_u(0.5),
+        # not 2*xi_d(0.5); build separate alpha = 0.5 matrices per side.
+        i05 = np.argmin(np.abs(alphas - 0.50))
+        i05_d_mat = np.tile(Pd_f[:, i05], (len(half_idx), 1)).T
+        i05_u_mat = np.tile(Pu_f[:, i05], (len(half_idx), 1)).T
         
-        num_d = Pd_f[:, one_m_idx] + Pd_f[:, half_idx] - 2 * i05_mat
+        num_d = Pd_f[:, one_m_idx] + Pd_f[:, half_idx] - 2 * i05_d_mat
         den_d = Pd_f[:, one_m_idx] - Pd_f[:, half_idx]
         
-        num_u = Pu_f[:, half_idx] + Pu_f[:, one_m_idx] - 2 * i05_mat
+        num_u = Pu_f[:, half_idx] + Pu_f[:, one_m_idx] - 2 * i05_u_mat
         den_u = Pu_f[:, half_idx] - Pu_f[:, one_m_idx]
         
-        hw = np.tile(int_weights[half_idx], (Pd_f.shape[0], 1))
+        hw = np.tile(half_weights, (Pd_f.shape[0], 1))
         
         S_in_int = 0.5 * (np.sum(num_d * hw, axis=1) / (np.sum(den_d * hw, axis=1) + 1e-9) +
                           np.sum(num_u * hw, axis=1) / (np.sum(den_u * hw, axis=1) + 1e-9))
@@ -404,6 +434,10 @@ def generate_latex(df, rho, beta, filepath):
     
     tex_df = df.copy()
     tex_df['Feasible'] = tex_df['Feasible'].astype(str)
+    # formatted strings are written into these columns below; cast to object
+    # first (newer pandas raises on assigning str into float64 columns)
+    for _col in ['Mean', 'Skew', 'Sharpe']:
+        tex_df[_col] = tex_df[_col].astype(object)
     
     for i in range(1, num_assets + 1):
         tex_df[f'W{i}'] = df[f'W{i}'].apply(lambda x: f"{x:.2f}" if pd.notnull(x) else "NA")
@@ -529,6 +563,15 @@ for r in rho_vals:
         plot_path = os.path.join(combo_dir, f"Sharpe_Profile_Rho{r:.2f}_Beta{b:.2f}.png")
         plot_sharpe_profile(df, r, b, plot_path)
         
+        # add the combo identifiers only after LaTeX/plot generation, so the
+        # extra columns do not end up in the generated table
+        df.insert(0, 'rho', r)
+        df.insert(1, 'beta', b)
+        df.to_csv(os.path.join(combo_dir, f"Results_Rho{r:.2f}_Beta{b:.2f}.csv"), index=False)
         all_combos.append(df)
 
+all_results = pd.concat(all_combos, ignore_index=True)
+all_results_csv = os.path.join(report_dir, "All_Results.csv")
+all_results.to_csv(all_results_csv, index=False)
+print(f"Combined results for all (rho, beta) combos written to: {all_results_csv}")
 print(f"Finished! Check the folder: {main_dir}")
